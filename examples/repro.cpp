@@ -87,7 +87,7 @@ auto compute_displacement() -> void {
     mfem::HypreParMatrix a_matrix;
     mfem::Vector b_vector;
     mfem::Vector x_vector;
-    a_form.FormLinearSystem(dirichlet_bdr_marker, displacement_gf, b_form, a_matrix, x_vector, b_vector);
+    a_form.FormLinearSystem(ess_tdof_list, displacement_gf, b_form, a_matrix, x_vector, b_vector);
 
     // Define and apply a parallel PCG solver for A X = B with the
     // BoomerAMG preconditioner from hypre.

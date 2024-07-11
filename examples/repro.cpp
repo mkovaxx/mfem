@@ -50,7 +50,7 @@ auto filter_density_field() -> void {
         inv_vol[i] = 1.0 / pmesh.GetElementVolume(i);
     }
 
-    auto radius = 3.0;
+    auto radius = 2.598076211353316;
     auto r = radius / (2.0 * sqrt(3.0));
     auto r_coeff = mfem::ConstantCoefficient(r * r);
     auto mass_coeff = mfem::ConstantCoefficient(1.0);

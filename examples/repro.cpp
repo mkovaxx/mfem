@@ -16,170 +16,102 @@
 // 3. ./repro
 ////////////////////////////////////////////////////////////////////////////////
 
+#include <array>
+#include <iostream>
+
 #include <mfem.hpp>
 
-auto compute_lambda(double E, double nu) -> double {
-    // E: Young's modulus, nu: Poisson's ratio
-    return E * nu / ((1.0 + nu) * (1.0 - 2.0 * nu));
+auto expect_no_hypre_error() -> void {
+    HYPRE_Int error_code = HYPRE_GetError();
+    if (error_code != 0) {
+        auto error_descr = std::array<char, 1024>();
+        HYPRE_DescribeError(error_code, error_descr.data());
+        std::cerr << "Hypre error code: " << error_code << ", " << error_descr.data() << std::endl;
+        throw std::runtime_error("Hypre error occurred.");
+    }
 }
 
-auto compute_mu(double E, double nu) -> double {
-    // E: Young's modulus, nu: Poisson's ratio
-    return E / (2.0 * (1.0 + nu));
-}
-
-auto compute_displacement() -> void {
+auto filter_density_field() -> void {
     // mesh has 1 physical volume: label 1, and 6 physical surfaces, labels 1..6
     auto mesh = mfem::Mesh::MakeCartesian3D(10, 10, 10, mfem::Element::TETRAHEDRON, 10.0, 10.0, 10.0);
-    int const bdr_attr_count = 6;
 
     auto pmesh = mfem::ParMesh(MPI_COMM_WORLD, mesh);
 
-    auto serial_nodal_vector_fec = mfem::H1_FECollection(1, 3);
-    auto serial_nodal_vector_space = mfem::FiniteElementSpace(&mesh, &serial_nodal_vector_fec, 3);
-    auto nodal_vector_space = mfem::ParFiniteElementSpace(serial_nodal_vector_space, pmesh);
+    auto serial_elem_fec = mfem::L2_FECollection(0, pmesh.SpaceDimension());
+    auto serial_elem_fes = mfem::FiniteElementSpace(&mesh, &serial_elem_fec, 1, mfem::Ordering::byVDIM);
+    auto elem_fes = mfem::ParFiniteElementSpace(serial_elem_fes, pmesh);
 
-    auto displacement_gf = mfem::ParGridFunction(&nodal_vector_space);
-    displacement_gf = 0.0;
+    auto serial_node_fec = mfem::H1_FECollection(1, pmesh.SpaceDimension());
+    auto serial_node_fes = mfem::FiniteElementSpace(&mesh, &serial_node_fec, 1, mfem::Ordering::byNODES);
+    auto node_fes = mfem::ParFiniteElementSpace(serial_node_fes, pmesh);
 
-    auto dirichlet_bdr_marker = mfem::Array<int>(bdr_attr_count);
-    dirichlet_bdr_marker = 0;
-    // attribute 1 is the fixed boundary
-    dirichlet_bdr_marker[0] = 1;
+    auto inv_vol = mfem::Vector(elem_fes.GetTrueVSize());
+    for (int i = 0; i < inv_vol.Size(); i++) {
+        inv_vol[i] = 1.0 / pmesh.GetElementVolume(i);
+    }
 
-    auto zero_displacement = mfem::Vector(3);
-    zero_displacement = 0.0;
-    auto dirichlet_coeff = mfem::VectorConstantCoefficient(zero_displacement);
-    displacement_gf.ProjectBdrCoefficient(dirichlet_coeff, dirichlet_bdr_marker);
+    auto radius = 3.0;
+    auto r = radius / (2.0 * sqrt(3.0));
+    auto r_coeff = mfem::ConstantCoefficient(r * r);
+    auto mass_coeff = mfem::ConstantCoefficient(1.0);
+    auto inv_vol_gf = mfem::ParGridFunction(&elem_fes);
+    inv_vol_gf.SetFromTrueDofs(inv_vol);
 
-    auto neumann_bdr_marker = mfem::Array<int>(bdr_attr_count);
-    neumann_bdr_marker = 0;
-    // attribute 6 is the pull down boundary
-    neumann_bdr_marker[5] = 1;
+    mfem::ParBilinearForm k_form(&node_fes);
+    k_form.AddDomainIntegrator(new mfem::DiffusionIntegrator(r_coeff));
+    k_form.AddDomainIntegrator(new mfem::MassIntegrator(mass_coeff));
+    k_form.Assemble();
+    //k_form.Finalize();
+    auto ess_tdof_list = mfem::Array<int>();
+    auto ess_bdr = mfem::Array<int>(pmesh.bdr_attributes.Max());
+    ess_bdr = 0;
+    k_form.FESpace()->GetEssentialTrueDofs(ess_bdr, ess_tdof_list);
 
-    auto pull_down = mfem::Vector(3);
-    pull_down = 0.0;
-    pull_down(1) = -1000.0;
-    auto neumann_coeff = mfem::VectorConstantCoefficient(pull_down);
+    auto a_matrix = mfem::HypreParMatrix();
+    k_form.FormSystemMatrix(ess_tdof_list, a_matrix);
 
-    // Material properties
-    double youngs = 1.0e7;
-    double poissons = 0.3;
+    mfem::ParMixedBilinearForm t_form(&elem_fes, &node_fes);
+    t_form.AddDomainIntegrator(new mfem::MixedScalarMassIntegrator(mass_coeff));
+    t_form.Assemble();
+    t_form.Finalize();
+    auto t_matrix = std::unique_ptr<mfem::HypreParMatrix const>(t_form.ParallelAssemble());
 
-    // Set up forms
-    mfem::ParBilinearForm a_form(displacement_gf.ParFESpace());
-    auto lambda = compute_lambda(youngs, poissons);
-    std::cout << "lambda: " << lambda << std::endl;
-    auto lambda_coeff = mfem::ConstantCoefficient(lambda);
-    auto mu = compute_mu(youngs, poissons);
-    std::cout << "mu: " << mu << std::endl;
-    auto mu_coeff = mfem::ConstantCoefficient(mu);
-    a_form.AddDomainIntegrator(new mfem::ElasticityIntegrator(lambda_coeff, mu_coeff));
-    a_form.Assemble();
+    auto inv_vol_coeff = mfem::GridFunctionCoefficient(&inv_vol_gf);
+    mfem::ParMixedBilinearForm t_star_form(&node_fes, &elem_fes);
+    t_star_form.AddDomainIntegrator(new mfem::MixedScalarMassIntegrator(inv_vol_coeff));
+    t_star_form.Assemble();
+    t_star_form.Finalize();
+    auto t_star_matrix = std::unique_ptr<mfem::HypreParMatrix const>(t_star_form.ParallelAssemble());
 
-    mfem::ParLinearForm b_form(displacement_gf.ParFESpace());
-    b_form.AddBoundaryIntegrator(new mfem::VectorBoundaryLFIntegrator(neumann_coeff), neumann_bdr_marker);
-    b_form.Assemble();
+    auto elem_density_gf = mfem::ParGridFunction(&elem_fes);
+    elem_density_gf = 1.0;
 
-    mfem::Array<int> ess_tdof_list;
-    displacement_gf.ParFESpace()->GetEssentialTrueDofs(dirichlet_bdr_marker, ess_tdof_list);
+    auto node_density = mfem::Vector(node_fes.GetTrueVSize());
+    t_matrix->Mult(elem_density_gf, node_density);
+    expect_no_hypre_error();
 
-    mfem::HypreParMatrix a_matrix;
-    mfem::Vector b_vector;
-    mfem::Vector x_vector;
-    a_form.FormLinearSystem(ess_tdof_list, displacement_gf, b_form, a_matrix, x_vector, b_vector);
+    auto node_density_filtered = mfem::Vector(node_fes.GetTrueVSize());
+    node_density_filtered = 0.0;
 
-    // Define and apply a parallel PCG solver for A X = B with the
-    // BoomerAMG preconditioner from hypre.
-    mfem::HypreBoomerAMG amg(a_matrix);
-    amg.SetPrintLevel(0);
-
-    mfem::HyprePCG pcg(a_matrix);
-    pcg.SetTol(1e-09);
-    pcg.SetMaxIter(5000);
-    pcg.SetPrintLevel(0);
+    auto amg = mfem::HypreBoomerAMG(a_matrix);
+    amg.SetPrintLevel(2);
+    auto pcg = mfem::HyprePCG(a_matrix);
+    pcg.SetTol(1e-12);
+    pcg.SetMaxIter(10000);
+    pcg.SetPrintLevel(2);
     pcg.SetPreconditioner(amg);
-    pcg.Mult(b_vector, x_vector);
+    pcg.Mult(node_density, node_density_filtered);
+    expect_no_hypre_error();
 
-    // Recover the solution as a finite element grid function.
-    a_form.RecoverFEMSolution(x_vector, b_form, displacement_gf);
-}
-
-auto compute_eigenmodes() -> void {
-    // mesh has 1 physical volume: label 1, and 6 physical surfaces, labels 1..6
-    auto mesh = mfem::Mesh::MakeCartesian3D(50, 10, 10, mfem::Element::TETRAHEDRON, 50.0, 10.0, 10.0);
-    int const bdr_attr_count = 6;
-
-    auto pmesh = mfem::ParMesh(MPI_COMM_WORLD, mesh);
-
-    auto serial_nodal_vector_fec = mfem::H1_FECollection(1, 3);
-    auto serial_nodal_vector_space = mfem::FiniteElementSpace(&mesh, &serial_nodal_vector_fec, 3);
-    auto nodal_vector_space = mfem::ParFiniteElementSpace(serial_nodal_vector_space, pmesh);
-
-    auto dirichlet_bdr_marker = mfem::Array<int>(bdr_attr_count);
-    dirichlet_bdr_marker = 0;
-    // attribute 1 is the fixed boundary
-    dirichlet_bdr_marker[0] = 1;
-
-    // Material properties
-    double youngs = 1.0e7;
-    double poissons = 0.3;
-    auto mass_density = 2710e-9;
-
-    // Set up forms
-    mfem::ParBilinearForm a_form(&nodal_vector_space);
-    auto lambda = compute_lambda(youngs, poissons);
-    std::cout << "lambda: " << lambda << std::endl;
-    auto lambda_coeff = mfem::ConstantCoefficient(lambda);
-    auto mu = compute_mu(youngs, poissons);
-    std::cout << "mu: " << mu << std::endl;
-    auto mu_coeff = mfem::ConstantCoefficient(mu);
-    a_form.AddDomainIntegrator(new mfem::ElasticityIntegrator(lambda_coeff, mu_coeff));
-    a_form.Assemble();
-    a_form.EliminateEssentialBCDiag(dirichlet_bdr_marker, 1.0);
-    a_form.Finalize();
-
-    mfem::ParBilinearForm m_form(&nodal_vector_space);
-    auto mass_density_coeff = mfem::ConstantCoefficient(mass_density);
-    m_form.AddDomainIntegrator(new mfem::VectorMassIntegrator(mass_density_coeff));
-    m_form.Assemble();
-    m_form.EliminateEssentialBCDiag(dirichlet_bdr_marker, std::numeric_limits<double>::min());
-    m_form.Finalize();
-
-    mfem::HypreParMatrix *a_matrix = a_form.ParallelAssemble();
-    mfem::HypreParMatrix *m_matrix = m_form.ParallelAssemble();
-
-    auto amg = mfem::HypreBoomerAMG(*a_matrix);
-    amg.SetPrintLevel(0);
-    int const vector_dimension = 3;
-    amg.SetSystemsOptions(vector_dimension);
-
-    auto lobpcg = mfem::HypreLOBPCG(MPI_COMM_WORLD);
-    lobpcg.SetNumModes(4);
-    lobpcg.SetPreconditioner(amg);
-    lobpcg.SetRandomSeed(0x10ADBEEF);
-    lobpcg.SetMaxIter(5000);
-    lobpcg.SetTol(1e-09);
-    lobpcg.SetPrecondUsageMode(1);
-    lobpcg.SetPrintLevel(2);
-    lobpcg.SetMassMatrix(*m_matrix);
-    lobpcg.SetOperator(*a_matrix);
-
-    lobpcg.Solve();
-
-    auto eigenvalues = mfem::Array<double>();
-    lobpcg.GetEigenvalues(eigenvalues);
-
-    delete a_matrix;
-    delete m_matrix;
+    auto elem_density_filtered_gf = mfem::ParGridFunction(&elem_fes);
+    elem_density_filtered_gf = 0.0;
+    t_star_matrix->Mult(node_density_filtered, elem_density_filtered_gf);
+    expect_no_hypre_error();
 }
 
 int main(int argc, char* argv[]) {
     mfem::Mpi::Init();
     mfem::Hypre::Init();
 
-    // Any other combination of these functions works except for this particular order;
-    // both succeed when called alone, as well as together but compute_eigenmodes() first.
-    compute_displacement();
-    compute_eigenmodes();
+    filter_density_field();
 }

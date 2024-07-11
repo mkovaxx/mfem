@@ -486,8 +486,8 @@ $(BLD)libmfem.$(SO_VER): $(OBJECT_FILES)
 	   $(EXT_LIBS) -o $(@)
 
 # Shortcut targets options
-serial debug cuda hip cudebug hipdebug:           M_MPI=NO
-parallel pdebug pcuda pcudebug phip phipdebug:    M_MPI=YES
+serial debug cuda hip cudebug hipdebug:           M_MPI=NO MFEM_USE_OPENMP=YES
+parallel pdebug pcuda pcudebug phip phipdebug:    M_MPI=YES MFEM_USE_OPENMP=YES
 serial parallel cuda pcuda hip phip:              M_DBG=NO
 debug pdebug cudebug pcudebug hipdebug phipdebug: M_DBG=YES
 cuda pcuda cudebug pcudebug:                      M_CUDA=YES
